@@ -1,6 +1,7 @@
 let electron = require("electron");
 // electron/preload.ts
 electron.contextBridge.exposeInMainWorld("core", {
+	openExternal: (url) => electron.ipcRenderer.invoke("shell:open", url),
 	call: (method, params) => electron.ipcRenderer.invoke("core:call", method, params),
 	onEvent: (cb) => {
 		const handler = (_, e) => cb(e);

@@ -1,4 +1,4 @@
-import { BrowserWindow, app, ipcMain } from "electron";
+import { BrowserWindow, app, ipcMain, shell } from "electron";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -9,13 +9,14 @@ var CoreClient = class extends EventEmitter {
 	proc;
 	nextId = 1;
 	pending = /* @__PURE__ */ new Map();
-	constructor(exePath) {
+	constructor(exePath, args = []) {
 		super();
 		this.proc = spawn(exePath, [], { stdio: [
 			"pipe",
 			"pipe",
 			"pipe"
 		] });
+		this.proc.on("error", (err) => console.error("[core] failed to start:", err.message));
 		readline.createInterface({ input: this.proc.stdout }).on("line", (line) => this.onLine(line));
 		this.proc.stderr.on("data", (d) => console.error("[core]", d.toString().trimEnd()));
 		this.proc.on("exit", (code) => {
@@ -74,15 +75,24 @@ function createWindow() {
 	else win.loadFile(path.join(__dirname, "../dist/index.html"));
 }
 app.whenReady().then(() => {
-	const exe = process.platform === "win32" ? "launcher_core_cli.exe" : "launcher_core_cli";
-	core = new CoreClient(app.isPackaged ? path.join(process.resourcesPath, "core", exe) : path.join(__dirname, "../../build/core", exe));
-	core.on("notification", (method, params) => win?.webContents.send("core:event", {
-		method,
-		params
-	}));
-	ipcMain.handle("core:call", (_e, method, params) => core.call(method, params));
 	createWindow();
-});
+	try {
+		const exe = process.platform === "win32" ? "launcher_core_cli.exe" : "launcher_core_cli";
+		const corePath = app.isPackaged ? path.join(process.resourcesPath, "core", exe) : path.join(__dirname, "../../build/core", exe);
+		console.log("[main] core path:", corePath);
+		core = new CoreClient(corePath, ["--data-dir", app.getPath("userData")]);
+		core.on("notification", (method, params) => win?.webContents.send("core:event", {
+			method,
+			params
+		}));
+		ipcMain.handle("core:call", (_e, method, params) => core.call(method, params));
+		ipcMain.handle("shell:open", (_e, url) => {
+			if (url.startsWith("https://")) shell.openExternal(url);
+		});
+	} catch (e) {
+		console.error("[main] startup error:", e);
+	}
+}).catch((e) => console.error("[main] whenReady failed:", e));
 app.on("before-quit", () => core?.kill());
 app.on("window-all-closed", () => app.quit());
 export {};

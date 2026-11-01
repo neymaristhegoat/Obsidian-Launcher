@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import path from 'node:path'
 import { CoreClient } from './core-client'
 import { fileURLToPath } from 'node:url' 
@@ -22,17 +22,26 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  const exe = process.platform === 'win32' ? 'launcher_core_cli.exe' : 'launcher_core_cli'
-  const corePath = app.isPackaged
-    ? path.join(process.resourcesPath, 'core', exe)
-    : path.join(__dirname, '../../build/core', exe)
+  createWindow()   // window first, so the UI always appears
 
-  core = new CoreClient(corePath)
-  core.on('notification', (method, params) => win?.webContents.send('core:event', { method, params }))
+  try {
+    const exe = process.platform === 'win32' ? 'launcher_core_cli.exe' : 'launcher_core_cli'
+    const corePath = app.isPackaged
+      ? path.join(process.resourcesPath, 'core', exe)
+      : path.join(__dirname, '../../build/core', exe)
+    console.log('[main] core path:', corePath)
 
-  ipcMain.handle('core:call', (_e, method: string, params: unknown) => core.call(method, params))
-  createWindow()
-})
+    core = new CoreClient(corePath, ['--data-dir', app.getPath('userData')])
+    core.on('notification', (method, params) =>
+      win?.webContents.send('core:event', { method, params }))
+    ipcMain.handle('core:call', (_e, method: string, params: unknown) => core.call(method, params))
+    ipcMain.handle('shell:open', (_e, url: string) => {
+      if (url.startsWith('https://')) shell.openExternal(url)
+    })
+  } catch (e) {
+    console.error('[main] startup error:', e)
+  }
+}).catch((e) => console.error('[main] whenReady failed:', e))
 
 app.on('before-quit', () => core?.kill())
 app.on('window-all-closed', () => app.quit())

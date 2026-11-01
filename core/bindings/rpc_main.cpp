@@ -1,9 +1,11 @@
 #include "launcher/auth.h"
+#include "launcher/ms_oauth.h"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -109,38 +111,75 @@ void dispatch(const json& req) {
     }).detach();
 }
 
+std::string g_data_dir = ".";
+std::mutex g_auth_mutex;
+std::thread g_auth_thread;
+std::atomic<bool> g_auth_cancel{false};
+
+// call with g_auth_mutex held
+void stop_auth_thread() {
+    g_auth_cancel = true;
+    if (g_auth_thread.joinable()) g_auth_thread.join();
+    g_auth_cancel = false;
+}
+
+json profile_json(const launcher::auth::McSession& s) {
+    return {{"uuid", s.uuid}, {"username", s.username}, {"accessToken", s.access_token}};
+}
+
 // ---------- register all methods here ----------
 
 void register_methods() {
-    add_sync("core.ping", [](const json&) {
-        return json{{"pong", true}};
-    });
+    add_async("auth.start", [](const json& p) {
+    const std::string client_id = p.at("clientId").get<std::string>();
+    auto dc = launcher::oauth::request_device_code(client_id);
 
-    // placeholder; replace with the real Mojang manifest fetch later
-    add_sync("versions.list", [](const json&) {
-        return json::array({"1.21.1", "1.20.4"});
-    });
-
-    // Steps 3-7 of the Microsoft chain, given a Microsoft access token
-    add_async("auth.mcLogin", [](const json& p) {
-        auto s = launcher::auth::login_with_ms_token(p.at("msAccessToken").get<std::string>());
-        return json{{"uuid", s.uuid}, {"username", s.username}, {"accessToken", s.access_token}};
-    });
-
-    // demo of a long task that emits notifications (delete once you have real ones)
-    add_async("core.slowTest", [](const json&) {
-        for (int i = 1; i <= 5; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            notify("download.progress", {{"done", i * 20}, {"total", 100}});
+    std::lock_guard<std::mutex> lock(g_auth_mutex);
+    stop_auth_thread();
+    g_auth_thread = std::thread([client_id, dc] {
+        try {
+            auto t = launcher::oauth::poll_device_token(
+                client_id, dc, [] { return g_auth_cancel.load(); });
+            // save first, so a failure in the Minecraft steps doesn't lose the sign-in
+            launcher::oauth::save_refresh_token(g_data_dir, t.refresh_token);
+            notify("auth.complete", profile_json(launcher::auth::login_with_ms_token(t.access_token)));
+        } catch (const std::exception& e) {
+            if (!g_auth_cancel) notify("auth.failed", {{"message", e.what()}});
         }
-        return json{{"ok", true}};
     });
+
+    return json{{"userCode", dc.user_code},
+                {"verificationUri", dc.verification_uri},
+                {"expiresIn", dc.expires_in}};
+});
+
+add_async("auth.cancel", [](const json&) {
+    std::lock_guard<std::mutex> lock(g_auth_mutex);
+    stop_auth_thread();
+    return json{{"ok", true}};
+});
+
+add_async("auth.refresh", [](const json& p) {
+    const std::string client_id = p.at("clientId").get<std::string>();
+    const std::string saved = launcher::oauth::load_refresh_token(g_data_dir);
+    if (saved.empty()) throw std::runtime_error("No saved login");
+
+    auto t = launcher::oauth::refresh_ms_token(client_id, saved);
+    if (!t.refresh_token.empty()) launcher::oauth::save_refresh_token(g_data_dir, t.refresh_token);
+    return profile_json(launcher::auth::login_with_ms_token(t.access_token));
+});
+
+add_sync("auth.logout", [](const json&) {
+    launcher::oauth::clear_refresh_token(g_data_dir);
+    return json{{"ok", true}};
+});
 }
 
 }  // namespace
 
-int main() {
-    // all logging goes to stderr; stdout is reserved for JSON-RPC
+int main(int argc, char** argv) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--data-dir") g_data_dir = argv[i + 1];
     auto logger = spdlog::stderr_color_mt("core");
     spdlog::set_default_logger(logger);
     spdlog::set_pattern("[%H:%M:%S] [%l] %v");
@@ -161,7 +200,10 @@ int main() {
         dispatch(req);
     }
 
-    // stdin closed (UI exited): let running async work finish, then quit
+  {   // before waiting on in-flight requests
+        std::lock_guard<std::mutex> lock(g_auth_mutex);
+        stop_auth_thread();
+    }
     std::unique_lock<std::mutex> lock(g_inflight_mutex);
     g_inflight_cv.wait(lock, [] { return g_inflight == 0; });
     return 0;

@@ -7,9 +7,10 @@ export class CoreClient extends EventEmitter {
   private nextId = 1
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
 
-  constructor(exePath: string) {
+  constructor(exePath: string, args: string[] = []) {
     super()
     this.proc = spawn(exePath, [], { stdio: ['pipe', 'pipe', 'pipe'] })
+    this.proc.on('error', (err) => console.error('[core] failed to start:', err.message))
     readline.createInterface({ input: this.proc.stdout }).on('line', (line) => this.onLine(line))
     this.proc.stderr.on('data', (d) => console.error('[core]', d.toString().trimEnd()))
     this.proc.on('exit', (code) => {

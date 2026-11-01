@@ -7,6 +7,7 @@ declare global {
   }
 
   interface CoreApi {
+    openExternal(url:string): Promise<void>
     call<T = any>(method: string, params?: unknown): Promise<T>
     onEvent(cb: (e: CoreEvent) => void): () => void
   }
