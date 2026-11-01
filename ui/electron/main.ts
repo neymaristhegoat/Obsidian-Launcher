@@ -1,7 +1,9 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import path from 'node:path'
 import { CoreClient } from './core-client'
+import { fileURLToPath } from 'node:url' 
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 let win: BrowserWindow | null = null
 let core: CoreClient
 
