@@ -4,4 +4,4 @@ dist/
 .venv/
 vcpkg_installed/
 *.log
-ui/src/accounts.json
+ui/accounts.json
