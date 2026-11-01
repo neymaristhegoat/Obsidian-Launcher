@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # one OS failing doesn't cancel the others
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/third_party/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # pulls vcpkg, which is a submodule
+
+      - name: Make binary cache folder
+        shell: bash
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+
+      - name: Cache vcpkg builds
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1    # Ninja needs the compiler on PATH
+
+      - name: Bootstrap vcpkg
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./third_party/vcpkg/bootstrap-vcpkg.bat
+          else
+            ./third_party/vcpkg/bootstrap-vcpkg.sh
+          fi
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test core (ping)
+        shell: bash
+        run: |
+          EXE=$(find build -name 'launcher_core_cli*' -type f \( -name 'launcher_core_cli' -o -name 'launcher_core_cli.exe' \) | head -n 1)
+          echo "Found: $EXE"
+          echo '{"jsonrpc":"2.0","id":1,"method":"core.ping"}' | "$EXE" | tee out.txt
+          grep -q '"pong":true' out.txt

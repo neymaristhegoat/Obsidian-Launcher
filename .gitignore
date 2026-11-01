@@ -1,0 +1,6 @@
+build/
+node_modules/
+dist/
+.venv/
+vcpkg_installed/
+*.log

@@ -1,0 +1,5 @@
+{
+    "name": "obsidian-launcher",
+    "version": "0.1.0",
+    "dependencies": ["cpr", "nlohmann-json", "openssl", "spdlog", "libzip", "gtest"]
+}
