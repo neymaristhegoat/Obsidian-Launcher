@@ -34,13 +34,21 @@ def sha256(path: Path) -> str:
 def write_manifest(artifact_dir: Path, target: str) -> Path:
     package = json.loads((ROOT / "ui" / "package.json").read_text(encoding="utf-8"))
     files = sorted(
-        file for file in artifact_dir.iterdir()
-        if file.is_file() and is_deliverable(file, target)
+        (
+            file for file in artifact_dir.iterdir()
+            if file.is_file() and is_deliverable(file, target)
+        ),
+        key=lambda file: (file.name.endswith(".sh"), file.name.lower()),
     )
     if not files:
         raise RuntimeError(f"No installer files were created in {artifact_dir}")
 
     entries = [{"file": file.name, "size": file.stat().st_size, "sha256": sha256(file)} for file in files]
+    for entry in entries:
+        print(f"Manifest: {entry['file']}")
+        print(f"Manifest hash: {entry['sha256']}")
+        print(f"Actual hash: {sha256(artifact_dir / entry['file'])}")
+        print()
     (artifact_dir / f"SHA256SUMS-{target}.txt").write_text(
         "".join(f"{item['sha256']}  {item['file']}\n" for item in entries), encoding="utf-8"
     )
