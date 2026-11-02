@@ -1,0 +1,86 @@
+name: Package desktop apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  package:
+    name: ${{ matrix.target }} installer
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux
+            os: ubuntu-latest
+          - target: windows
+            os: windows-latest
+          - target: macos
+            os: macos-latest
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/third_party/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Create vcpkg cache
+        shell: bash
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-package-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-package-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libsecret-1-dev
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Prepare MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Bootstrap vcpkg
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./third_party/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          else
+            ./third_party/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          fi
+
+      - name: Check build and release tooling
+        run: python tools/test.py --python-only
+
+      - name: Build installers
+        run: python tools/package.py --platform ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obsidian-launcher-${{ matrix.target }}
+          path: artifacts/${{ matrix.target }}/download/*
+          if-no-files-found: error
+          retention-days: 30

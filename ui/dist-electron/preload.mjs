@@ -1,11 +1,1 @@
-let electron = require("electron");
-// electron/preload.ts
-electron.contextBridge.exposeInMainWorld("core", {
-	openExternal: (url) => electron.ipcRenderer.invoke("shell:open", url),
-	call: (method, params) => electron.ipcRenderer.invoke("core:call", method, params),
-	onEvent: (cb) => {
-		const handler = (_, e) => cb(e);
-		electron.ipcRenderer.on("core:event", handler);
-		return () => electron.ipcRenderer.removeListener("core:event", handler);
-	}
-});
+let e=require("electron");e.contextBridge.exposeInMainWorld(`core`,{openExternal:t=>e.ipcRenderer.invoke(`shell:open`,t),pickFile:()=>e.ipcRenderer.invoke(`dialog:pick-file`),launchGame:t=>e.ipcRenderer.invoke(`game:launch`,t),call:(t,n)=>e.ipcRenderer.invoke(`core:call`,t,n),onEvent:t=>{let n=(e,n)=>t(n);return e.ipcRenderer.on(`core:event`,n),()=>e.ipcRenderer.removeListener(`core:event`,n)}});

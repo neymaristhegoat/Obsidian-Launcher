@@ -23,6 +23,18 @@ jobs:
         with:
           submodules: recursive   # pulls vcpkg, which is a submodule
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Make binary cache folder
         shell: bash
         run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
@@ -36,7 +48,7 @@ jobs:
 
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libsecret-1-dev
 
       - name: Install macOS build tools
         if: runner.os == 'macOS'
@@ -55,19 +67,5 @@ jobs:
             ./third_party/vcpkg/bootstrap-vcpkg.sh
           fi
 
-      - name: Configure
-        run: cmake --preset default
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Smoke test core (ping)
-        shell: bash
-        run: |
-          EXE=$(find build -name 'launcher_core_cli*' -type f \( -name 'launcher_core_cli' -o -name 'launcher_core_cli.exe' \) | head -n 1)
-          echo "Found: $EXE"
-          echo '{"jsonrpc":"2.0","id":1,"method":"core.ping"}' | "$EXE" | tee out.txt
-          grep -q '"pong":true' out.txt
+      - name: Run Python, core, storage, and UI checks
+        run: python tools/test.py

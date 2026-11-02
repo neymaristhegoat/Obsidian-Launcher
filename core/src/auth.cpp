@@ -52,7 +52,8 @@ XboxToken xbl_authenticate(const std::string& ms_access_token) {
     };
     json j = post_json("https://user.auth.xboxlive.com/user/authenticate", body);
     return { j.at("Token").get<std::string>(),
-             j.at("DisplayClaims").at("xui").at(0).at("uhs").get<std::string>() };
+             j.at("DisplayClaims").at("xui").at(0).at("uhs").get<std::string>(),
+             j.at("DisplayClaims").at("xui").at(0).value("xid", std::string()) };
 }
 
 // Step 4
@@ -71,7 +72,8 @@ XboxToken xsts_authorize(const std::string& xbl_token) {
         throw std::runtime_error(xsts_error_message(j["XErr"].get<long long>()));
 
     return { j.at("Token").get<std::string>(),
-             j.at("DisplayClaims").at("xui").at(0).at("uhs").get<std::string>() };
+             j.at("DisplayClaims").at("xui").at(0).at("uhs").get<std::string>(),
+             j.at("DisplayClaims").at("xui").at(0).value("xid", std::string()) };
 }
 
 // Step 5
@@ -92,7 +94,7 @@ bool owns_game(const std::string& mc_token) {
 }
 
 // Step 7
-McSession get_profile(const std::string& mc_token) {
+McSession get_profile(const std::string& mc_token, const std::string& xuid) {
     auto r = cpr::Get(cpr::Url{"https://api.minecraftservices.com/minecraft/profile"},
                       cpr::Bearer{mc_token}, cpr::Timeout{15000});
     if (r.status_code == 404)
@@ -100,7 +102,7 @@ McSession get_profile(const std::string& mc_token) {
     if (r.status_code != 200)
         throw std::runtime_error("Profile request failed (" + std::to_string(r.status_code) + ")");
     json j = json::parse(r.text);
-    return { mc_token, j.at("id").get<std::string>(), j.at("name").get<std::string>() };
+    return { mc_token, j.at("id").get<std::string>(), j.at("name").get<std::string>(), xuid };
 }
 
 McSession login_with_ms_token(const std::string& ms_access_token) {
@@ -111,7 +113,7 @@ McSession login_with_ms_token(const std::string& ms_access_token) {
     spdlog::info("auth: Minecraft token");
     auto mc = minecraft_login(xsts);
     spdlog::info("auth: profile");
-    return get_profile(mc);   // 404 here means no Java Edition
+    return get_profile(mc, xsts.xuid);   // 404 here means no Java Edition
 }
 
 } // namespace launcher::auth

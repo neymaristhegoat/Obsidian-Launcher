@@ -1,14 +1,22 @@
 {
   "name": "ui",
+  "description": "A desktop launcher for managing Minecraft instances.",
+  "author": {
+    "name": "Obsidian Launcher contributors",
+    "email": "neymaristhegoat@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/neymaristhegoat/Obsidian-Launcher",
+  "desktopName": "obsidian-launcher",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dist": "pnpm run build && electron-builder --config electron-builder.config.cjs --publish never"
   },
   "dependencies": {
     "react": "^19.3.1",

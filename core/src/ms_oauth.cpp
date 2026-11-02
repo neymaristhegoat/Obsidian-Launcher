@@ -2,13 +2,10 @@
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <thread>
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;
 
 namespace launcher::oauth {
 
@@ -32,8 +29,6 @@ MsTokens parse_tokens(const json& j) {
     return { j.at("access_token").get<std::string>(),
              j.value("refresh_token", std::string()) };
 }
-
-fs::path token_file(const std::string& dir) { return fs::path(dir) / "accounts.json"; }
 
 } // namespace
 
@@ -93,31 +88,6 @@ MsTokens refresh_ms_token(const std::string& client_id, const std::string& refre
         throw std::runtime_error("Session expired, please sign in again: " +
                                  j.value("error_description", j.value("error", std::string())));
     return parse_tokens(j);   // refresh tokens rotate, so save the new one
-}
-
-void save_refresh_token(const std::string& dir, const std::string& token) {
-    fs::create_directories(dir);
-    const auto path = token_file(dir);
-    {
-        std::ofstream f(path, std::ios::trunc);
-        if (!f) throw std::runtime_error("Cannot write " + path.string());
-        f << json{{"refreshToken", token}}.dump();
-    }
-    std::error_code ec;   // owner-only on Linux/macOS; mostly a no-op on Windows
-    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace, ec);
-}
-
-std::string load_refresh_token(const std::string& dir) {
-    std::ifstream f(token_file(dir));
-    if (!f) return {};
-    json j = json::parse(f, nullptr, false);
-    return j.is_object() ? j.value("refreshToken", std::string()) : std::string();
-}
-
-void clear_refresh_token(const std::string& dir) {
-    std::error_code ec;
-    fs::remove(token_file(dir), ec);
 }
 
 } // namespace launcher::oauth

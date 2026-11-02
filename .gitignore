@@ -5,3 +5,7 @@ dist/
 vcpkg_installed/
 *.log
 ui/accounts.json
+artifacts/
+__pycache__/
+*.py[cod]
+obsidian-data/

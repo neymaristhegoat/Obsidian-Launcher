@@ -1,17 +1,26 @@
 #include "launcher/accounts.h"
+#include "launcher/config.h"
 #include "launcher/auth.h"
+#include "launcher/instance.h"
+#include "launcher/launch_builder.h"
 #include "launcher/ms_oauth.h"
+#include "launcher/minecraft_installer.h"
+#include "launcher/modrinth.h"
 #include "launcher/offline.h"
+#include "launcher/version_manifest.h"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -120,6 +129,18 @@ std::string g_data_dir = ".";
 std::mutex g_auth_mutex;
 std::thread g_auth_thread;
 std::atomic<bool> g_auth_cancel{false};
+std::mutex g_install_mutex;
+std::unordered_map<std::string, std::shared_ptr<std::atomic_bool>> g_install_jobs;
+
+struct InstallJobGuard {
+    std::string instance_id;
+    std::shared_ptr<std::atomic_bool> cancelled;
+    ~InstallJobGuard() {
+        std::lock_guard<std::mutex> lock(g_install_mutex);
+        const auto found = g_install_jobs.find(instance_id);
+        if (found != g_install_jobs.end() && found->second == cancelled) g_install_jobs.erase(found);
+    }
+};
 
 // call with g_auth_mutex held
 void stop_auth_thread() {
@@ -141,7 +162,7 @@ json offline_session(const acc::Account& a) {
 json microsoft_session(const launcher::auth::McSession& s) {
     return {{"id", acc::make_id("microsoft", s.uuid)}, {"type", "microsoft"},
             {"username", s.username}, {"uuid", s.uuid},
-            {"accessToken", s.access_token}, {"offline", false}};
+            {"accessToken", s.access_token}, {"xuid", s.xuid}, {"offline", false}};
 }
 
 // Refreshes a saved Microsoft account and returns a live session.
@@ -164,9 +185,100 @@ void register_methods() {
         return json{{"pong", true}};
     });
 
-    // placeholder; replace with the real Mojang manifest fetch later
-    add_sync("versions.list", [](const json&) {
-        return json::array({"1.21.1", "1.20.4"});
+    add_sync("config.read", [](const json&) {
+        return launcher::config::read();
+    });
+    add_sync("config.write", [](const json& p) {
+        return launcher::config::write_settings(p.at("settings"));
+    });
+
+    add_sync("instances.list", [](const json&) {
+        return launcher::instance::list(g_data_dir);
+    });
+    add_sync("instances.save", [](const json& p) {
+        return launcher::instance::save(g_data_dir, p.at("profile"));
+    });
+    add_sync("instances.delete", [](const json& p) {
+        launcher::instance::remove_files(g_data_dir, p.at("instanceId").get<std::string>());
+        return json{{"ok", true}};
+    });
+
+    add_sync("game.launchSpec", [](const json& p) {
+        return launcher::launch_builder::build(g_data_dir, p);
+    });
+
+    // These account snapshot calls are only used by Electron's main process safeStorage bridge.
+    add_sync("accounts.snapshot", [](const json&) {
+        return launcher::accounts::snapshot();
+    });
+    add_sync("accounts.restore", [](const json& p) {
+        launcher::accounts::restore(p.at("snapshot"));
+        return json{{"ok", true}};
+    });
+
+    // The UI calls this once at startup and the core refreshes its disk cache.
+    add_async("versions.list", [](const json&) {
+        return launcher::version_manifest::fetch(g_data_dir);
+    });
+
+    add_async("instances.install", [](const json& p) {
+        const auto instance_id = p.at("instanceId").get<std::string>();
+        auto cancelled = std::make_shared<std::atomic_bool>(false);
+        {
+            std::lock_guard<std::mutex> lock(g_install_mutex);
+            if (g_install_jobs.contains(instance_id))
+                throw std::runtime_error("This instance is already installing");
+            g_install_jobs[instance_id] = cancelled;
+        }
+        InstallJobGuard cleanup{instance_id, cancelled};
+        try {
+            return launcher::minecraft_installer::install(
+                g_data_dir, instance_id, cancelled,
+                [instance_id](const std::string& message, int percent, const std::string& state) {
+                    notify("instances.install.progress",
+                           {{"instanceId", instance_id}, {"message", message},
+                            {"percent", percent}, {"state", state}});
+                });
+        } catch (const std::exception& error) {
+            const bool was_cancelled = cancelled->load();
+            notify("instances.install.progress",
+                   {{"instanceId", instance_id},
+                    {"message", was_cancelled ? "Installation cancelled" : error.what()},
+                    {"percent", 0}, {"state", was_cancelled ? "cancelled" : "failed"}});
+            throw;
+        }
+    });
+    add_sync("instances.install.cancel", [](const json& p) {
+        const auto instance_id = p.at("instanceId").get<std::string>();
+        std::shared_ptr<std::atomic_bool> token;
+        {
+            std::lock_guard<std::mutex> lock(g_install_mutex);
+            const auto found = g_install_jobs.find(instance_id);
+            if (found == g_install_jobs.end()) return json{{"requested", false}};
+            token = found->second;
+            token->store(true);
+        }
+        notify("instances.install.progress",
+               {{"instanceId", instance_id}, {"message", "Cancelling after the current download stops…"},
+                {"percent", 0}, {"state", "cancelling"}});
+        return json{{"requested", true}};
+    });
+
+    add_async("modrinth.search", [](const json& p) {
+        return launcher::modrinth::search(p);
+    });
+    add_async("modrinth.installed", [](const json& p) {
+        return launcher::modrinth::installed(g_data_dir, p);
+    });
+    add_async("modrinth.install", [](const json& p) {
+        return launcher::modrinth::install(g_data_dir, p);
+    });
+    add_async("modrinth.remove", [](const json& p) {
+        return launcher::modrinth::remove(g_data_dir, p);
+    });
+    add_sync("instances.deleteFiles", [](const json& p) {
+        launcher::instance::remove_files(g_data_dir, p.at("instanceId").get<std::string>());
+        return json{{"ok", true}};
     });
 
     // demo of a long task that emits notifications
@@ -276,8 +388,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i)
         if (std::string(argv[i]) == "--data-dir") g_data_dir = argv[i + 1];
 
-    // all logging goes to stderr; stdout is reserved for JSON-RPC
-    auto logger = spdlog::stderr_color_mt("core");
+    launcher::config::initialize(g_data_dir);
+
+    // stdout is reserved for JSON-RPC; retain a per-user launcher log on disk.
+    auto console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+        (std::filesystem::path(g_data_dir) / "logs" / "launcher.log").string(), true);
+    auto logger = std::make_shared<spdlog::logger>("core", spdlog::sinks_init_list{console_sink, file_sink});
+    spdlog::register_logger(logger);
     spdlog::set_default_logger(logger);
     spdlog::set_pattern("[%H:%M:%S] [%l] %v");
 

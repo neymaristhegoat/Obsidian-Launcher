@@ -25,9 +25,4 @@ MsTokens poll_device_token(const std::string& client_id, const DeviceCode& dc,
 
 MsTokens refresh_ms_token(const std::string& client_id, const std::string& refresh_token);
 
-// Refresh token storage (a file for now; move to the OS keychain later)
-void save_refresh_token(const std::string& dir, const std::string& token);
-std::string load_refresh_token(const std::string& dir);
-void clear_refresh_token(const std::string& dir);
-
 }
