@@ -9,7 +9,7 @@ type ModLoader = 'vanilla' | 'fabric' | 'forge' | 'neoforge' | 'quilt'
 const CLIENT_ID = '6be102b8-2980-4c03-bd3b-3185c27713f4'
 interface SavedAccount { id: string; type: 'offline' | 'microsoft'; username: string; uuid: string }
 interface Session extends SavedAccount { accessToken: string; offline: boolean; xuid?: string }
-interface GameInstance { id: string; name: string; version: string; createdAt: number; loader?: ModLoader; memory?: number; javaPath?: string; installed?: boolean; installedVersion?: string }
+interface GameInstance { id: string; name: string; version: string; createdAt: number; loader?: ModLoader; memory?: number; javaPath?: string; installed?: boolean; installedVersion?: string; installedLoader?: ModLoader; installedLoaderVersion?: string }
 interface GameVersion { id: string; type: string; url: string; time: string; releaseTime: string; sha1: string; complianceLevel: number }
 interface VersionManifest { versions: GameVersion[]; source: 'network' | 'cache'; fetchedAt: number }
 interface Settings { theme: Theme; memory: number; javaPath: string }
@@ -357,11 +357,31 @@ export default function App() {
     setInstallingInstance(instance)
     setInstallationStatus('installing')
     setInstallationProgress(0)
-    setInstallationLogs([`Starting Minecraft ${instance.version} installation for ${instance.name}.`])
-    void window.core.call('instances.install', { instanceId: instance.id }).then(() => {
+    setInstallationLogs([`Saving ${instance.name} settings…`])
+    // The setup dialog edits the local UI state. Persist the latest profile before
+    // the native installer reads instance.json, so the selected loader is visible
+    // to the C++ installer and launch builder.
+    void window.core.call('instances.save', { profile: instance }).then(async () => {
+      setInstallationLogs([`Starting Minecraft ${instance.version} installation for ${instance.name}.`])
+      // The native installer returns the exact loader it installed. Keep those
+      // backend-managed fields in React state so the debounced profile autosave
+      // cannot overwrite instance.json with a stale pre-install profile.
+      return window.core.call<{
+        instanceId: string
+        version: string
+        installed: boolean
+        loader: ModLoader
+        loaderVersion: string
+      }>('instances.install', { instanceId: instance.id })
+    }).then((result) => {
       setInstallationStatus('complete')
       setInstallationProgress(100)
-      updateInstance(instance.id, { installed: true, installedVersion: instance.version })
+      updateInstance(instance.id, {
+        installed: result.installed,
+        installedVersion: result.version,
+        installedLoader: result.loader,
+        installedLoaderVersion: result.loader === 'fabric' ? result.loaderVersion : undefined,
+      })
     }).catch((error) => {
       const message = errorMessage(error)
       const cancelled = message.toLowerCase().includes('cancel')

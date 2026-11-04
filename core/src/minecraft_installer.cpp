@@ -1,6 +1,7 @@
 #include "launcher/minecraft_installer.h"
 
 #include "launcher/instance.h"
+#include "launcher/mod_loader.h"
 #include "launcher/version_manifest.h"
 
 #include <cpr/cpr.h>
@@ -572,6 +573,31 @@ json install(const std::string& data_dir, const std::string& instance_id,
         replace_file(temporary, metadata_path);
     }
 
+    const auto selected_loader = profile.value("loader", std::string("vanilla"));
+    json loader_profile;
+    std::string loader_version;
+    json launch_metadata = metadata;
+    const auto fabric_profile_path = minecraft_dir / "obsidian-fabric-profile.json";
+    ensure_no_symlink_components(profile_path, fs::path(".minecraft") / "obsidian-fabric-profile.json");
+    if (selected_loader == "fabric") {
+        context.report("Finding the latest stable Fabric Loader", 7);
+        auto fabric = launcher::mod_loader::fetch_latest_fabric_profile(version_id, cancelled);
+        loader_version = fabric.loader_version;
+        loader_profile = std::move(fabric.profile);
+        launch_metadata = launcher::mod_loader::merge_fabric_profile(metadata, loader_profile);
+        const auto temporary = fs::path(fabric_profile_path.string() + ".tmp");
+        { std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+          output << loader_profile.dump(2);
+          if (!output) throw std::runtime_error("Cannot save Fabric launcher profile"); }
+        replace_file(temporary, fabric_profile_path);
+        context.report("Fabric Loader " + loader_version + " selected", 8);
+    } else if (selected_loader == "vanilla") {
+        std::error_code ignored_remove;
+        fs::remove(fabric_profile_path, ignored_remove);
+    } else {
+        throw std::runtime_error("This mod loader is not supported by the installer yet: " + selected_loader);
+    }
+
     if (!metadata.contains("downloads") || !metadata["downloads"].is_object() ||
         !metadata["downloads"].contains("client"))
         throw std::runtime_error("This Minecraft version does not provide a client download");
@@ -584,7 +610,7 @@ json install(const std::string& data_dir, const std::string& instance_id,
     context.report("Minecraft client installed", 22);
 
     std::vector<NativeArchive> natives;
-    const auto libraries = prepare_libraries(metadata, root, natives);
+    const auto libraries = prepare_libraries(launch_metadata, root, natives);
     download_group(libraries, context, "libraries", 22, 23);
 
     json asset_index = metadata.value("assetIndex", json::object());
@@ -629,9 +655,16 @@ json install(const std::string& data_dir, const std::string& instance_id,
     auto installed_profile = profile;
     installed_profile["installed"] = true;
     installed_profile["installedVersion"] = version_id;
+    installed_profile["installedLoader"] = selected_loader;
+    if (selected_loader == "fabric") {
+        installed_profile["installedLoaderVersion"] = loader_version;
+    } else {
+        installed_profile.erase("installedLoaderVersion");
+    }
     launcher::instance::save(data_dir, installed_profile);
     context.report("Minecraft " + version_id + " installed successfully", 100, "complete");
     return {{"instanceId", instance_id}, {"version", version_id}, {"installed", true},
+            {"loader", selected_loader}, {"loaderVersion", loader_version},
             {"libraryCount", libraries.size()}, {"assetCount", assets.size()},
             {"nativeCount", natives.size()}};
 }

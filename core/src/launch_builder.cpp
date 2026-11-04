@@ -3,6 +3,7 @@
 #include "launcher/accounts.h"
 #include "launcher/config.h"
 #include "launcher/instance.h"
+#include "launcher/mod_loader.h"
 #include "launcher/offline.h"
 
 #include <algorithm>
@@ -323,11 +324,16 @@ json build(const std::string& data_dir, const json& params) {
     fs::path instance_dir;
     const auto profile = read_instance(data_dir, instance_id, instance_dir);
     const auto version_id = profile.value("version", std::string());
-    if (profile.value("loader", std::string("vanilla")) != "vanilla")
-        throw std::runtime_error("This launcher can launch vanilla profiles. Mod loader installation is not available yet.");
+    const auto selected_loader = profile.value("loader", std::string("vanilla"));
+    if (selected_loader != "vanilla" && selected_loader != "fabric")
+        throw std::runtime_error("This mod loader is not supported yet: " + selected_loader);
     if (!safe_identifier(version_id)) throw std::runtime_error("Instance has an invalid Minecraft version");
     if (profile.value("installedVersion", std::string()) != version_id)
         throw std::runtime_error("Install this Minecraft version before launching it");
+    if (profile.value("installedLoader", std::string("vanilla")) != selected_loader)
+        throw std::runtime_error("Install this instance's selected mod loader before launching it");
+    if (selected_loader == "fabric" && profile.value("installedLoaderVersion", std::string()).empty())
+        throw std::runtime_error("Fabric Loader is not installed. Reinstall this instance before launching it.");
 
     const auto account_id = session.value("id", std::string());
     const auto saved_account = launcher::accounts::get(account_id);
@@ -364,8 +370,19 @@ json build(const std::string& data_dir, const json& params) {
     const auto metadata_path = version_dir / (version_id + ".json");
     std::ifstream metadata_file(metadata_path);
     if (!metadata_file) throw std::runtime_error("Minecraft version files are missing. Reinstall this version and try again.");
-    const auto metadata = json::parse(metadata_file, nullptr, false);
-    if (!metadata.is_object()) throw std::runtime_error("Minecraft version metadata is invalid. Reinstall this version and try again.");
+    const auto vanilla_metadata = json::parse(metadata_file, nullptr, false);
+    if (!vanilla_metadata.is_object()) throw std::runtime_error("Minecraft version metadata is invalid. Reinstall this version and try again.");
+    json metadata = vanilla_metadata;
+    if (selected_loader == "fabric") {
+        const auto fabric_profile_path = instance_dir / ".minecraft" / "obsidian-fabric-profile.json";
+        std::ifstream fabric_file(fabric_profile_path);
+        if (!fabric_file)
+            throw std::runtime_error("Fabric launcher files are missing. Reinstall this instance before launching it.");
+        const auto fabric_profile = json::parse(fabric_file, nullptr, false);
+        if (!fabric_profile.is_object() || fabric_profile.value("inheritsFrom", std::string()) != version_id)
+            throw std::runtime_error("Fabric launcher profile does not match this Minecraft version. Reinstall this instance.");
+        metadata = launcher::mod_loader::merge_fabric_profile(vanilla_metadata, fabric_profile);
+    }
     const auto client_path = version_dir / (version_id + ".jar");
     if (!fs::is_regular_file(client_path)) throw std::runtime_error("Minecraft client files are missing. Reinstall this version and try again.");
     const auto main_class = metadata.value("mainClass", std::string());
