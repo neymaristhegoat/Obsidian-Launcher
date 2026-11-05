@@ -9,7 +9,7 @@ type ModLoader = 'vanilla' | 'fabric' | 'forge' | 'neoforge' | 'quilt'
 const CLIENT_ID = '6be102b8-2980-4c03-bd3b-3185c27713f4'
 interface SavedAccount { id: string; type: 'offline' | 'microsoft'; username: string; uuid: string }
 interface Session extends SavedAccount { accessToken: string; offline: boolean; xuid?: string }
-interface GameInstance { id: string; name: string; version: string; createdAt: number; loader?: ModLoader; memory?: number; javaPath?: string; installed?: boolean; installedVersion?: string; installedLoader?: ModLoader; installedLoaderVersion?: string }
+interface GameInstance { id: string; name: string; version: string; createdAt: number; loader?: ModLoader; memory?: number; javaPath?: string; installed?: boolean; installedVersion?: string; installedLoader?: ModLoader; installedLoaderVersion?: string; installedLoaderProfileId?: string }
 interface GameVersion { id: string; type: string; url: string; time: string; releaseTime: string; sha1: string; complianceLevel: number }
 interface VersionManifest { versions: GameVersion[]; source: 'network' | 'cache'; fetchedAt: number }
 interface Settings { theme: Theme; memory: number; javaPath: string }
@@ -372,6 +372,7 @@ export default function App() {
         installed: boolean
         loader: ModLoader
         loaderVersion: string
+        loaderProfileId: string
       }>('instances.install', { instanceId: instance.id })
     }).then((result) => {
       setInstallationStatus('complete')
@@ -380,7 +381,8 @@ export default function App() {
         installed: result.installed,
         installedVersion: result.version,
         installedLoader: result.loader,
-        installedLoaderVersion: result.loader === 'fabric' ? result.loaderVersion : undefined,
+        installedLoaderVersion: result.loader === 'fabric' || result.loader === 'forge' ? result.loaderVersion : undefined,
+        installedLoaderProfileId: result.loader === 'forge' ? result.loaderProfileId : undefined,
       })
     }).catch((error) => {
       const message = errorMessage(error)

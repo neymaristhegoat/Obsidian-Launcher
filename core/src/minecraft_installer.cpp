@@ -1,6 +1,7 @@
 #include "launcher/minecraft_installer.h"
 
 #include "launcher/instance.h"
+#include "launcher/config.h"
 #include "launcher/mod_loader.h"
 #include "launcher/version_manifest.h"
 
@@ -9,6 +10,10 @@
 #include <zip.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <sstream>
+#include <chrono>
+#include <cstring>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -18,9 +23,25 @@
 #include <mutex>
 #include <regex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -288,31 +309,108 @@ void add_download(std::map<std::string, DownloadItem>& plan, DownloadItem item) 
         throw std::runtime_error("Minecraft metadata contains conflicting library checksums");
 }
 
-DownloadItem artifact_from(const json& artifact, const fs::path& install_root) {
-    if (!artifact.is_object() || !artifact.contains("url") || !artifact["url"].is_string() ||
-        !artifact.contains("path") || !artifact["path"].is_string())
-        throw std::runtime_error("Minecraft library metadata is missing an artifact path or URL");
+fs::path artifact_destination(const json& artifact, const fs::path& install_root) {
+    if (!artifact.is_object() || !artifact.contains("path") || !artifact["path"].is_string())
+        throw std::runtime_error("Minecraft library metadata is missing an artifact path");
     const auto relative = safe_relative_path(artifact.at("path").get<std::string>());
     ensure_no_symlink_components(install_root / "libraries", relative);
-    return {artifact.at("url").get<std::string>(), install_root / "libraries" / relative,
+    return install_root / "libraries" / relative;
+}
+
+DownloadItem artifact_from(const json& artifact, const fs::path& install_root) {
+    if (!artifact.is_object() || !artifact.contains("url") || !artifact["url"].is_string() ||
+        artifact["url"].get<std::string>().empty())
+        throw std::runtime_error("Minecraft library metadata is missing an artifact download URL");
+    return {artifact.at("url").get<std::string>(), artifact_destination(artifact, install_root),
             artifact.value("sha1", std::string()), artifact.value("size", std::uint64_t{0})};
 }
 
+void prepare_profile_artifact(const json& artifact, const fs::path& install_root,
+                              std::map<std::string, DownloadItem>& plan) {
+    const auto destination = artifact_destination(artifact, install_root);
+    if (artifact.contains("url") && artifact["url"].is_string() &&
+        !artifact["url"].get<std::string>().empty()) {
+        add_download(plan, artifact_from(artifact, install_root));
+        return;
+    }
+
+    // Forge's generated version manifests commonly contain path-only artifact
+    // records. The official Forge installer has already downloaded or generated
+    // those files, so reuse them rather than inventing a Maven repository URL.
+    if (!fs::is_regular_file(destination)) {
+        throw std::runtime_error("Forge's installer did not create a required library: " +
+                                 destination.string());
+    }
+    const auto expected_sha1 = artifact.value("sha1", std::string());
+    const auto expected_size = artifact.value("size", std::uint64_t{0});
+    if ((!expected_sha1.empty() || expected_size > 0) &&
+        !file_matches(destination, expected_sha1, expected_size)) {
+        throw std::runtime_error("A library created by Forge's installer failed its integrity check: " +
+                                 destination.string());
+    }
+}
+
+void prepare_coordinate_library(const json& library, const std::string& coordinate,
+                                const fs::path& install_root,
+                                std::vector<NativeArchive>& natives,
+                                std::map<std::string, DownloadItem>& plan,
+                                bool reuse_existing_libraries,
+                                bool include_main, bool include_native) {
+    if (coordinate.empty()) return;
+    const auto base = [&]() { return library_base_url(library); };
+    auto prepare_coordinate_file = [&](const std::string& artifact_coordinate,
+                                       const fs::path& destination) {
+        if (reuse_existing_libraries && fs::is_regular_file(destination)) return;
+        if (reuse_existing_libraries && !library.contains("url"))
+            throw std::runtime_error("Forge's installer did not create a required library: " +
+                                     destination.string());
+        const auto relative_url = coordinate_path(artifact_coordinate);
+        add_download(plan, {base() + relative_url, destination, {}, 0});
+    };
+
+    if (include_main) {
+        const auto relative = safe_relative_path(coordinate_path(coordinate));
+        ensure_no_symlink_components(install_root / "libraries", relative);
+        prepare_coordinate_file(coordinate, install_root / "libraries" / relative);
+    }
+
+    if (include_native && library.contains("natives") && library["natives"].is_object() &&
+        library["natives"].contains(platform_name())) {
+        auto classifier = library["natives"].at(platform_name()).get<std::string>();
+        const std::string token = "${arch}";
+        for (auto position = classifier.find(token); position != std::string::npos;
+             position = classifier.find(token, position + native_arch_token().size()))
+            classifier.replace(position, token.size(), native_arch_token());
+        const auto native_coordinate = coordinate + ":" + classifier;
+        const auto relative = safe_relative_path(coordinate_path(native_coordinate));
+        ensure_no_symlink_components(install_root / "libraries", relative);
+        const auto destination = install_root / "libraries" / relative;
+        natives.push_back({destination, exclusions(library)});
+        prepare_coordinate_file(native_coordinate, destination);
+    }
+}
+
 std::vector<DownloadItem> prepare_libraries(const json& metadata, const fs::path& install_root,
-                                             std::vector<NativeArchive>& natives) {
+                                             std::vector<NativeArchive>& natives,
+                                             bool reuse_existing_libraries = false) {
     std::map<std::string, DownloadItem> plan;
     if (!metadata.contains("libraries") || !metadata["libraries"].is_array()) return {};
     for (const auto& library : metadata["libraries"]) {
         if (!library.is_object() || !library_allowed(library)) continue;
-        const auto base = library_base_url(library);
         const auto coordinate = library.value("name", std::string());
-        if (library.contains("downloads") && library["downloads"].is_object()) {
+        const bool has_downloads = library.contains("downloads") && library["downloads"].is_object();
+        bool artifact_prepared = false;
+        bool native_prepared = false;
+        bool has_classifiers = false;
+        if (has_downloads) {
             const auto& downloads = library["downloads"];
-            if (downloads.contains("artifact") && downloads["artifact"].is_object())
-                add_download(plan, artifact_from(downloads["artifact"], install_root));
+            if (downloads.contains("artifact") && downloads["artifact"].is_object()) {
+                prepare_profile_artifact(downloads["artifact"], install_root, plan);
+                artifact_prepared = true;
+            }
+            has_classifiers = downloads.contains("classifiers") && downloads["classifiers"].is_object();
             if (library.contains("natives") && library["natives"].is_object() &&
-                library["natives"].contains(platform_name()) && downloads.contains("classifiers") &&
-                downloads["classifiers"].is_object()) {
+                library["natives"].contains(platform_name()) && has_classifiers) {
                 auto classifier = library["natives"].at(platform_name()).get<std::string>();
                 const std::string token = "${arch}";
                 for (auto position = classifier.find(token); position != std::string::npos;
@@ -320,30 +418,31 @@ std::vector<DownloadItem> prepare_libraries(const json& metadata, const fs::path
                     classifier.replace(position, token.size(), native_arch_token());
                 const auto& classifiers = downloads["classifiers"];
                 if (classifiers.contains(classifier)) {
-                    auto item = artifact_from(classifiers.at(classifier), install_root);
-                    natives.push_back({item.destination, exclusions(library)});
-                    add_download(plan, std::move(item));
+                    const auto& native_artifact = classifiers.at(classifier);
+                    const auto native_path = artifact_destination(native_artifact, install_root);
+                    natives.push_back({native_path, exclusions(library)});
+                    prepare_profile_artifact(native_artifact, install_root, plan);
+                    native_prepared = true;
                 }
             }
-        } else if (!coordinate.empty()) {
-            const auto path = coordinate_path(coordinate);
-            const auto relative = safe_relative_path(path);
-            ensure_no_symlink_components(install_root / "libraries", relative);
-            add_download(plan, {base + path, install_root / "libraries" / relative, {}, 0});
-            if (library.contains("natives") && library["natives"].is_object() &&
-                library["natives"].contains(platform_name())) {
-                auto classifier = library["natives"].at(platform_name()).get<std::string>();
-                const std::string token = "${arch}";
-                for (auto position = classifier.find(token); position != std::string::npos;
-                     position = classifier.find(token, position + native_arch_token().size()))
-                    classifier.replace(position, token.size(), native_arch_token());
-                const auto native_path = coordinate_path(coordinate + ":" + classifier);
-                const auto native_relative = safe_relative_path(native_path);
-                ensure_no_symlink_components(install_root / "libraries", native_relative);
-                const auto destination = install_root / "libraries" / native_relative;
-                natives.push_back({destination, exclusions(library)});
-                add_download(plan, {base + native_path, destination, {}, 0});
-            }
+        }
+
+        // Vanilla/Fabric manifests keep their original downloads behavior. Forge
+        // sometimes has an empty downloads object and expects its installed Maven
+        // coordinate to be used instead; do not mistake classifier-only libraries
+        // for regular classpath artifacts.
+        const bool coordinate_main_fallback = !artifact_prepared && !has_downloads && !coordinate.empty();
+        const bool forge_main_fallback = reuse_existing_libraries && !artifact_prepared &&
+                                         has_downloads && !has_classifiers && !coordinate.empty();
+        const bool coordinate_native_fallback = !native_prepared && !has_downloads && !coordinate.empty();
+        const bool forge_native_fallback = reuse_existing_libraries && !native_prepared &&
+                                           has_downloads && !has_classifiers && !coordinate.empty();
+        if (coordinate_main_fallback || forge_main_fallback ||
+            coordinate_native_fallback || forge_native_fallback) {
+            prepare_coordinate_library(library, coordinate, install_root, natives, plan,
+                                       reuse_existing_libraries,
+                                       coordinate_main_fallback || forge_main_fallback,
+                                       coordinate_native_fallback || forge_native_fallback);
         }
     }
     std::vector<DownloadItem> result;
@@ -511,6 +610,312 @@ json load_instance(const std::string& data_dir, const std::string& instance_id, 
         throw std::runtime_error("Instance profile is invalid");
     return profile;
 }
+ 
+
+fs::path installer_java_executable(const json& profile) {
+    auto configured = profile.value("javaPath", std::string());
+    if (configured.empty()) {
+        const auto config = launcher::config::read();
+        const auto settings = config.value("settings", json::object());
+        if (settings.is_object()) configured = settings.value("javaPath", std::string());
+    }
+#ifdef _WIN32
+    const std::string executable_name = "java.exe";
+#else
+    const std::string executable_name = "java";
+#endif
+    auto usable = [](const fs::path& candidate) {
+        std::error_code error;
+        if (!fs::is_regular_file(candidate, error) || error) return false;
+#ifdef _WIN32
+        return true;
+#else
+        return ::access(candidate.c_str(), X_OK) == 0;
+#endif
+    };
+    if (!configured.empty()) {
+        fs::path candidate(configured);
+        std::error_code error;
+        if (fs::is_directory(candidate, error)) candidate /= fs::path("bin") / executable_name;
+        if (usable(candidate)) return candidate;
+        throw std::runtime_error("The configured Java executable was not found or is not executable. Select a Java runtime in launcher settings.");
+    }
+    if (const char* home = std::getenv("JAVA_HOME")) {
+        const auto candidate = fs::path(home) / "bin" / executable_name;
+        if (usable(candidate)) return candidate;
+    }
+    if (const char* path_env = std::getenv("PATH")) {
+#ifdef _WIN32
+        constexpr char separator = ';';
+#else
+        constexpr char separator = ':';
+#endif
+        const std::string paths(path_env);
+        std::size_t offset = 0;
+        while (offset <= paths.size()) {
+            const auto end = paths.find(separator, offset);
+            const auto directory = paths.substr(offset, end == std::string::npos ? end : end - offset);
+            const auto candidate = fs::path(directory.empty() ? "." : directory) / executable_name;
+            if (usable(candidate)) return candidate;
+            if (end == std::string::npos) break;
+            offset = end + 1;
+        }
+    }
+#ifndef _WIN32
+    for (const auto& candidate : {fs::path("/usr/bin/java"), fs::path("/usr/local/bin/java")})
+        if (usable(candidate)) return candidate;
+#endif
+    throw std::runtime_error("Java was not found. Install a compatible Java runtime or select one in launcher settings before installing Forge.");
+}
+
+std::string read_log_tail(const fs::path& path, std::size_t max_bytes = 6000) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    input.seekg(0, std::ios::end);
+    const auto size = input.tellg();
+    if (size > static_cast<std::streamoff>(max_bytes)) input.seekg(-static_cast<std::streamoff>(max_bytes), std::ios::end);
+    else input.seekg(0, std::ios::beg);
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+#ifdef _WIN32
+std::wstring quote_windows_argument(const std::wstring& value) {
+    std::wstring result = L"\"";
+    std::size_t slashes = 0;
+    for (const wchar_t ch : value) {
+        if (ch == L'\\') { ++slashes; continue; }
+        if (ch == L'\"') {
+            result.append(slashes * 2 + 1, L'\\');
+            result.push_back(L'\"');
+            slashes = 0;
+            continue;
+        }
+        result.append(slashes, L'\\');
+        slashes = 0;
+        result.push_back(ch);
+    }
+    result.append(slashes * 2, L'\\');
+    result.push_back(L'\"');
+    return result;
+}
+#endif
+
+int run_forge_installer(const fs::path& java, const fs::path& installer,
+                        const fs::path& target, const fs::path& log_path,
+                        const InstallContext& context) {
+    context.check_cancelled();
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    HANDLE log_handle = CreateFileW(log_path.wstring().c_str(), GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log_handle == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Cannot create Forge installer log file");
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = log_handle;
+    startup.hStdError = log_handle;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    std::wstring command = quote_windows_argument(java.wstring()) + L" -jar " +
+                           quote_windows_argument(installer.wstring()) + L" --installClient " +
+                           quote_windows_argument(target.wstring());
+    const auto working_directory = target.wstring();
+    const BOOL created = CreateProcessW(java.wstring().c_str(), command.data(), nullptr, nullptr,
+                                        TRUE, CREATE_NO_WINDOW, nullptr, working_directory.c_str(),
+                                        &startup, &process);
+    const DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(log_handle);
+    if (!created)
+        throw std::runtime_error("Could not start Forge's official installer (Windows error " +
+                                 std::to_string(create_error) + ")");
+    DWORD wait_result = WAIT_TIMEOUT;
+    while (wait_result == WAIT_TIMEOUT) {
+        if (context.cancelled && context.cancelled->load()) {
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, INFINITE);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            throw std::runtime_error("Installation cancelled");
+        }
+        wait_result = WaitForSingleObject(process.hProcess, 250);
+        if (wait_result == WAIT_FAILED) {
+            const DWORD wait_error = GetLastError();
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, INFINITE);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            throw std::runtime_error("Could not wait for Forge's installer (Windows error " +
+                                     std::to_string(wait_error) + ")");
+        }
+    }
+    DWORD exit_code = 1;
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        const DWORD exit_error = GetLastError();
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        throw std::runtime_error("Could not read Forge installer exit code (Windows error " +
+                                 std::to_string(exit_error) + ")");
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exit_code);
+#else
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0)
+        throw std::runtime_error("Could not prepare Forge installer process");
+    const auto destroy_actions = [&] { posix_spawn_file_actions_destroy(&actions); };
+    if (posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log_path.c_str(),
+                                         O_WRONLY | O_CREAT | O_TRUNC, 0600) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) != 0) {
+        destroy_actions();
+        throw std::runtime_error("Could not redirect Forge installer output to its log file");
+    }
+    std::vector<std::string> arguments{java.string(), "-jar", installer.string(),
+                                       "--installClient", target.string()};
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    argv.push_back(nullptr);
+    pid_t process = -1;
+    const int spawn_error = posix_spawn(&process, java.c_str(), &actions, nullptr, argv.data(), environ);
+    destroy_actions();
+    if (spawn_error != 0)
+        throw std::runtime_error("Could not start Forge's official installer: " + std::string(std::strerror(spawn_error)));
+    int status = 0;
+    for (;;) {
+        const auto waited = waitpid(process, &status, WNOHANG);
+        if (waited == process) break;
+        if (waited < 0 && errno != EINTR) {
+            kill(process, SIGTERM);
+            waitpid(process, &status, 0);
+            throw std::runtime_error("Could not wait for Forge's installer process");
+        }
+        if (context.cancelled && context.cancelled->load()) {
+            kill(process, SIGTERM);
+            waitpid(process, &status, 0);
+            throw std::runtime_error("Installation cancelled");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+#endif
+}
+
+std::pair<std::string, json> find_forge_profile(const fs::path& root,
+                                                 const std::string& minecraft_version,
+                                                 const std::string& forge_build) {
+    const auto versions_dir = root / "versions";
+    std::error_code error;
+    for (fs::directory_iterator it(versions_dir, error), end; !error && it != end; it.increment(error)) {
+        if (!it->is_directory(error)) continue;
+        const auto profile_id = it->path().filename().string();
+        auto normalized_profile_id = profile_id;
+        std::transform(normalized_profile_id.begin(), normalized_profile_id.end(),
+                       normalized_profile_id.begin(), [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
+        // Legacy Forge profile IDs often omit the trailing Minecraft-version
+        // suffix from the Maven coordinate (for example, the artifact may be
+        // 10.13.4.1614-1.7.10 while the profile ID is 1.7.10-Forge10.13.4.1614).
+        // Match the full suffix when present, otherwise match the numeric build
+        // as a complete component so 47.4.2 cannot accidentally match 47.4.28.
+        const auto build_suffix = forge_build.find('-');
+        const auto build_core = forge_build.substr(0, build_suffix);
+        const auto contains_component = [](const std::string& value, const std::string& token) {
+            std::size_t position = 0;
+            while ((position = value.find(token, position)) != std::string::npos) {
+                const auto after = position + token.size();
+                if (after == value.size() || value[after] == '-' || value[after] == '_') return true;
+                position = after;
+            }
+            return false;
+        };
+        if (normalized_profile_id.find("forge") == std::string::npos ||
+            (!contains_component(normalized_profile_id, forge_build) &&
+             !contains_component(normalized_profile_id, build_core))) continue;
+        const auto manifest_path = it->path() / (profile_id + ".json");
+        std::ifstream input(manifest_path);
+        if (!input) continue;
+        auto metadata = json::parse(input, nullptr, false);
+        if (!metadata.is_object()) continue;
+        const auto id = metadata.value("id", profile_id);
+        if (id != profile_id) continue;
+        const auto inherited = metadata.value("inheritsFrom", std::string());
+        if (!inherited.empty() && inherited != minecraft_version) continue;
+        if (inherited.empty() && !profile_id.starts_with(minecraft_version)) continue;
+        if (!metadata.contains("mainClass") || !metadata["mainClass"].is_string() ||
+            metadata["mainClass"].get<std::string>().empty() ||
+            !metadata.contains("libraries") || !metadata["libraries"].is_array()) continue;
+        return {profile_id, std::move(metadata)};
+    }
+    throw std::runtime_error("Forge's installer finished but its generated launcher profile could not be found. See the Forge installer log in the launcher data folder.");
+}
+
+class LauncherProfilesStub {
+public:
+    explicit LauncherProfilesStub(const fs::path& root)
+        : path_(root / "launcher_profiles.json"),
+          backup_(root / "launcher_profiles.json.obsidian-forge-backup") {
+        std::error_code error;
+        if (fs::exists(path_, error)) {
+            ensure_no_symlink_components(root, "launcher_profiles.json");
+            std::ifstream input(path_);
+            auto existing = json::parse(input, nullptr, false);
+            if (!existing.is_object())
+                throw std::runtime_error("Forge requires a valid launcher_profiles.json in the launcher data folder");
+            ensure_no_symlink_components(root, "launcher_profiles.json.obsidian-forge-backup");
+            fs::copy_file(path_, backup_, fs::copy_options::overwrite_existing, error);
+            if (error)
+                throw std::runtime_error("Cannot preserve the existing Forge launcher profile file: " + error.message());
+            backed_up_ = true;
+            return;
+        }
+        ensure_no_symlink_components(root, "launcher_profiles.json");
+        std::ofstream output(path_, std::ios::binary | std::ios::trunc);
+        if (!output) throw std::runtime_error("Cannot prepare the Forge installer profile file");
+        output << R"({"profiles":{}})";
+        if (!output) throw std::runtime_error("Cannot write the Forge installer profile file");
+        created_ = true;
+    }
+    ~LauncherProfilesStub() {
+        std::error_code ignored;
+        if (backed_up_) {
+            fs::remove(path_, ignored);
+            ignored.clear();
+            fs::rename(backup_, path_, ignored);
+            if (ignored) {
+                ignored.clear();
+                fs::copy_file(backup_, path_, fs::copy_options::overwrite_existing, ignored);
+                if (!ignored) fs::remove(backup_, ignored);
+            }
+        } else if (created_) {
+            fs::remove(path_, ignored);
+        }
+    }
+    LauncherProfilesStub(const LauncherProfilesStub&) = delete;
+    LauncherProfilesStub& operator=(const LauncherProfilesStub&) = delete;
+private:
+    fs::path path_;
+    fs::path backup_;
+    bool created_ = false;
+    bool backed_up_ = false;
+};
+
+std::string sha1_token(std::string text) {
+    const auto first = text.find_first_of("0123456789abcdefABCDEF");
+    if (first == std::string::npos || text.size() - first < 40)
+        throw std::runtime_error("Forge installer checksum metadata is invalid");
+    const auto value = text.substr(first, 40);
+    if (!std::all_of(value.begin(), value.end(), [](unsigned char ch) { return std::isxdigit(ch); }))
+        throw std::runtime_error("Forge installer checksum metadata is invalid");
+    return lower(value);
+}
 
 }  // namespace
 
@@ -576,6 +981,7 @@ json install(const std::string& data_dir, const std::string& instance_id,
     const auto selected_loader = profile.value("loader", std::string("vanilla"));
     json loader_profile;
     std::string loader_version;
+    std::string loader_profile_id;
     json launch_metadata = metadata;
     const auto fabric_profile_path = minecraft_dir / "obsidian-fabric-profile.json";
     ensure_no_symlink_components(profile_path, fs::path(".minecraft") / "obsidian-fabric-profile.json");
@@ -591,6 +997,44 @@ json install(const std::string& data_dir, const std::string& instance_id,
           if (!output) throw std::runtime_error("Cannot save Fabric launcher profile"); }
         replace_file(temporary, fabric_profile_path);
         context.report("Fabric Loader " + loader_version + " selected", 8);
+    } else if (selected_loader == "forge") {
+        context.report("Checking Forge builds for Minecraft " + version_id, 7);
+        loader_version = launcher::mod_loader::fetch_latest_forge_version(version_id, cancelled);
+        const auto forge_artifact_version = version_id + "-" + loader_version;
+        const auto installer_name = "forge-" + forge_artifact_version + "-installer.jar";
+        const auto installer_path = root / "meta" / installer_name;
+        const auto log_path = root / "meta" / ("forge-installer-" + forge_artifact_version + ".log");
+        fs::create_directories(root / "meta");
+        ensure_no_symlink_components(root, fs::path("meta") / installer_name);
+        ensure_no_symlink_components(root, fs::path("meta") / ("forge-installer-" + forge_artifact_version + ".log"));
+        const auto installer_url = "https://maven.minecraftforge.net/net/minecraftforge/forge/" +
+                                   forge_artifact_version + "/" + installer_name;
+        context.report("Downloading Forge " + loader_version + " installer", 9);
+        const auto checksum_text = fetch_text(installer_url + ".sha1", context);
+        const auto installer_sha1 = sha1_token(checksum_text);
+        download_one({installer_url, installer_path, installer_sha1, 0}, context);
+
+        context.report("Running Forge's official installer and client processors", 12);
+        {
+            LauncherProfilesStub launcher_profiles(root);
+            const auto java = installer_java_executable(profile);
+            const auto exit_code = run_forge_installer(java, installer_path,
+                                                       fs::absolute(root), log_path, context);
+            if (exit_code != 0) {
+                auto details = read_log_tail(log_path);
+                throw std::runtime_error("Forge installer failed with exit code " +
+                    std::to_string(exit_code) + (details.empty() ? std::string() : "\n" + details) +
+                    "\nFull installer log: " + log_path.string());
+            }
+            context.check_cancelled();
+            auto installed = find_forge_profile(root, version_id, loader_version);
+            loader_profile_id = std::move(installed.first);
+            loader_profile = std::move(installed.second);
+        }
+        launch_metadata = launcher::mod_loader::merge_forge_profile(metadata, loader_profile);
+        context.report("Forge " + loader_version + " installed", 17);
+        std::error_code ignored_remove;
+        fs::remove(fabric_profile_path, ignored_remove);
     } else if (selected_loader == "vanilla") {
         std::error_code ignored_remove;
         fs::remove(fabric_profile_path, ignored_remove);
@@ -604,14 +1048,21 @@ json install(const std::string& data_dir, const std::string& instance_id,
     const auto& client = metadata["downloads"]["client"];
     if (!client.is_object() || !client.contains("url"))
         throw std::runtime_error("Minecraft client download metadata is invalid");
-    context.report("Downloading Minecraft " + version_id + " client", 8);
+    const int client_start = selected_loader == "forge" ? 18 : 8;
+    const int client_end = selected_loader == "forge" ? 30 : 22;
+    const int library_start = client_end;
+    const int library_span = selected_loader == "forge" ? 20 : 23;
+    const int assets_start = library_start + library_span + 2;
+    const int assets_span = 94 - assets_start;
+    context.report("Downloading Minecraft " + version_id + " client", client_start);
     download_one({client.at("url").get<std::string>(), client_path,
                   client.value("sha1", std::string()), client.value("size", std::uint64_t{0})}, context);
-    context.report("Minecraft client installed", 22);
+    context.report("Minecraft client installed", client_end);
 
     std::vector<NativeArchive> natives;
-    const auto libraries = prepare_libraries(launch_metadata, root, natives);
-    download_group(libraries, context, "libraries", 22, 23);
+    const auto libraries = prepare_libraries(launch_metadata, root, natives,
+                                             selected_loader == "forge");
+    download_group(libraries, context, "libraries", library_start, library_span);
 
     json asset_index = metadata.value("assetIndex", json::object());
     if (!asset_index.is_object() || !asset_index.contains("url")) {
@@ -626,7 +1077,7 @@ json install(const std::string& data_dir, const std::string& instance_id,
     const auto asset_index_sha1 = asset_index.value("sha1", std::string());
     ensure_no_symlink_components(root, fs::path("assets") / "indexes" / (asset_index_id + ".json"));
     if (!file_matches(asset_index_path, asset_index_sha1, asset_index.value("size", std::uint64_t{0}))) {
-        context.report("Fetching Minecraft asset index", 47);
+        context.report("Fetching Minecraft asset index", assets_start);
         const auto text = fetch_text(asset_index.at("url").get<std::string>(), context);
         const auto index_json = json::parse(text, nullptr, false);
         if (!index_json.is_object()) throw std::runtime_error("Minecraft returned an invalid asset index");
@@ -640,7 +1091,7 @@ json install(const std::string& data_dir, const std::string& instance_id,
     auto index_json = json::parse(index_file, nullptr, false);
     if (!index_json.is_object()) throw std::runtime_error("Minecraft asset index could not be read");
     const auto assets = prepare_assets(index_json, root);
-    download_group(assets, context, "assets", 47, 47);
+    download_group(assets, context, "assets", assets_start, assets_span);
 
     const auto native_dir = root / "natives" / version_id;
     std::error_code ignored;
@@ -656,15 +1107,21 @@ json install(const std::string& data_dir, const std::string& instance_id,
     installed_profile["installed"] = true;
     installed_profile["installedVersion"] = version_id;
     installed_profile["installedLoader"] = selected_loader;
-    if (selected_loader == "fabric") {
+    if (selected_loader == "fabric" || selected_loader == "forge") {
         installed_profile["installedLoaderVersion"] = loader_version;
     } else {
         installed_profile.erase("installedLoaderVersion");
+    }
+    if (selected_loader == "forge") {
+        installed_profile["installedLoaderProfileId"] = loader_profile_id;
+    } else {
+        installed_profile.erase("installedLoaderProfileId");
     }
     launcher::instance::save(data_dir, installed_profile);
     context.report("Minecraft " + version_id + " installed successfully", 100, "complete");
     return {{"instanceId", instance_id}, {"version", version_id}, {"installed", true},
             {"loader", selected_loader}, {"loaderVersion", loader_version},
+            {"loaderProfileId", loader_profile_id},
             {"libraryCount", libraries.size()}, {"assetCount", assets.size()},
             {"nativeCount", natives.size()}};
 }

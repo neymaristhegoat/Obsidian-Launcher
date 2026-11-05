@@ -125,18 +125,24 @@ std::string coordinate_path(const std::string& coordinate) {
     return path + "." + extension;
 }
 
-std::vector<fs::path> classpath_libraries(const json& metadata, const fs::path& root) {
+std::vector<fs::path> classpath_libraries(const json& metadata, const fs::path& root,
+                                         bool forge_coordinate_fallback = false) {
     std::vector<fs::path> result;
     if (!metadata.contains("libraries") || !metadata["libraries"].is_array()) return result;
     for (const auto& library : metadata["libraries"]) {
         if (!library.is_object() || !allowed(library)) continue;
         std::string relative;
-        const bool has_download_metadata = library.contains("downloads") && library["downloads"].is_object();
-        if (has_download_metadata && library["downloads"].contains("artifact") &&
-            library["downloads"]["artifact"].is_object())
+        if (library.contains("downloads") && library["downloads"].is_object() &&
+            library["downloads"].contains("artifact") && library["downloads"]["artifact"].is_object())
             relative = library["downloads"]["artifact"].value("path", std::string());
-        if (relative.empty() && !has_download_metadata && library.contains("name") && library["name"].is_string())
-            relative = coordinate_path(library["name"].get<std::string>());
+        // Forge can emit an empty/incomplete downloads object while still
+        // identifying an installed Maven artifact by its coordinate.
+        const bool has_downloads = library.contains("downloads") && library["downloads"].is_object();
+        if (relative.empty() && library.contains("name") && library["name"].is_string() &&
+            (!has_downloads || forge_coordinate_fallback)) {
+            const auto coordinate = library["name"].get<std::string>();
+            if (!coordinate.empty()) relative = coordinate_path(coordinate);
+        }
         if (relative.empty()) continue;
         const auto path = root / "libraries" / safe_relative_path(relative);
         if (!fs::is_regular_file(path))
@@ -325,7 +331,7 @@ json build(const std::string& data_dir, const json& params) {
     const auto profile = read_instance(data_dir, instance_id, instance_dir);
     const auto version_id = profile.value("version", std::string());
     const auto selected_loader = profile.value("loader", std::string("vanilla"));
-    if (selected_loader != "vanilla" && selected_loader != "fabric")
+    if (selected_loader != "vanilla" && selected_loader != "fabric" && selected_loader != "forge")
         throw std::runtime_error("This mod loader is not supported yet: " + selected_loader);
     if (!safe_identifier(version_id)) throw std::runtime_error("Instance has an invalid Minecraft version");
     if (profile.value("installedVersion", std::string()) != version_id)
@@ -334,6 +340,10 @@ json build(const std::string& data_dir, const json& params) {
         throw std::runtime_error("Install this instance's selected mod loader before launching it");
     if (selected_loader == "fabric" && profile.value("installedLoaderVersion", std::string()).empty())
         throw std::runtime_error("Fabric Loader is not installed. Reinstall this instance before launching it.");
+    if (selected_loader == "forge" &&
+        (profile.value("installedLoaderVersion", std::string()).empty() ||
+         !safe_identifier(profile.value("installedLoaderProfileId", std::string()))))
+        throw std::runtime_error("Forge is not installed correctly. Reinstall this instance before launching it.");
 
     const auto account_id = session.value("id", std::string());
     const auto saved_account = launcher::accounts::get(account_id);
@@ -382,13 +392,28 @@ json build(const std::string& data_dir, const json& params) {
         if (!fabric_profile.is_object() || fabric_profile.value("inheritsFrom", std::string()) != version_id)
             throw std::runtime_error("Fabric launcher profile does not match this Minecraft version. Reinstall this instance.");
         metadata = launcher::mod_loader::merge_fabric_profile(vanilla_metadata, fabric_profile);
+    } else if (selected_loader == "forge") {
+        const auto forge_profile_id = profile.value("installedLoaderProfileId", std::string());
+        const auto forge_profile_path = root / "versions" / forge_profile_id / (forge_profile_id + ".json");
+        std::ifstream forge_file(forge_profile_path);
+        if (!forge_file)
+            throw std::runtime_error("Forge launcher files are missing. Reinstall this instance before launching it.");
+        const auto forge_profile = json::parse(forge_file, nullptr, false);
+        const auto forge_id = forge_profile.is_object() ? forge_profile.value("id", std::string()) : std::string();
+        const auto inherited_version = forge_profile.is_object()
+            ? forge_profile.value("inheritsFrom", std::string()) : std::string();
+        if (!forge_profile.is_object() || forge_id != forge_profile_id ||
+            (!inherited_version.empty() && inherited_version != version_id) ||
+            (inherited_version.empty() && !forge_profile_id.starts_with(version_id)))
+            throw std::runtime_error("Forge launcher profile does not match this Minecraft version. Reinstall this instance.");
+        metadata = launcher::mod_loader::merge_forge_profile(vanilla_metadata, forge_profile);
     }
     const auto client_path = version_dir / (version_id + ".jar");
     if (!fs::is_regular_file(client_path)) throw std::runtime_error("Minecraft client files are missing. Reinstall this version and try again.");
     const auto main_class = metadata.value("mainClass", std::string());
     if (main_class.empty()) throw std::runtime_error("Minecraft version metadata has no main class");
 
-    std::vector<fs::path> classpath = classpath_libraries(metadata, root);
+    std::vector<fs::path> classpath = classpath_libraries(metadata, root, selected_loader == "forge");
     classpath.push_back(client_path);
     const auto classpath_value = classpath_join(classpath);
 #ifdef _WIN32
@@ -411,8 +436,11 @@ json build(const std::string& data_dir, const json& params) {
     if (memory < 1 || memory > 64) throw std::runtime_error("Instance memory allocation must be between 1 and 64 GB");
     const auto version_type = metadata.value("type", std::string("release"));
     const std::string user_properties = "{}";
+    const auto launch_version_name = selected_loader == "forge"
+        ? profile.value("installedLoaderProfileId", version_id)
+        : version_id;
     std::map<std::string, std::string> values{
-        {"auth_player_name", username}, {"version_name", version_id},
+        {"auth_player_name", username}, {"version_name", launch_version_name},
         {"game_directory", path_utf8(minecraft_dir)}, {"assets_root", path_utf8(root / "assets")},
         {"assets_index_name", asset_index_name}, {"auth_uuid", uuid},
         {"auth_access_token", access_token}, {"auth_session", access_token}, {"user_type", user_type},
